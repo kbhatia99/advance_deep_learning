@@ -3,42 +3,36 @@ import torch
 from .bignet import BIGNET_DIM, LayerNorm
 
 
-def block_quantize_4bit_optimized(x: torch.Tensor, group_size: int = 256) -> tuple[torch.Tensor, torch.Tensor]:
+def block_quantize_4bit_optimized(x: torch.Tensor, group_size: int = 512) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """
-    Ultra-compressed 4-bit quantization with maximum group size.
+    Ultra-ultra-compressed 4-bit with massive groups.
     """
     assert x.dim() == 1
     assert x.size(0) % group_size == 0
 
     x = x.view(-1, group_size)
     
-    # Use scale + zero point but store together
+    # Simple min/max but with massive groups to minimize overhead
     x_min = x.min(dim=-1, keepdim=True).values
     x_max = x.max(dim=-1, keepdim=True).values
     
-    # Calculate scale and zero point
-    scale = (x_max - x_min) / 15
-    zero_point = x_min
-    
     # Quantize
-    x_norm = (x - zero_point) / (scale + 1e-8)
-    x_quant = x_norm.round().clamp(0, 15).to(torch.uint8)
+    x_range = x_max - x_min
+    x_norm = (x - x_min) / (x_range + 1e-8)
+    x_quant = (x_norm * 15).round().to(torch.uint8)
     
     # Pack 2 values per byte
     x_packed = (x_quant[:, 0::2] & 0xF) + ((x_quant[:, 1::2] & 0xF) << 4)
     
-    # Pack scale and zero together
-    params = torch.stack([scale.squeeze(-1), zero_point.squeeze(-1)], dim=-1).to(torch.float16)
-    
-    return x_packed, params
+    return x_packed, x_range.squeeze(-1).to(torch.float16), x_min.squeeze(-1).to(torch.float16)
 
 
-def block_dequantize_4bit_optimized(x_packed: torch.Tensor, params: torch.Tensor) -> torch.Tensor:
+def block_dequantize_4bit_optimized(x_packed: torch.Tensor, ranges: torch.Tensor, mins: torch.Tensor) -> torch.Tensor:
     """
-    Dequantize using packed parameters.
+    Dequantize using separate range and min.
     """
-    scales = params[..., 0:1].to(torch.float32)
-    zeros = params[..., 1:2].to(torch.float32)
+    ranges = ranges.to(torch.float32).unsqueeze(-1)
+    mins = mins.to(torch.float32).unsqueeze(-1)
     
     # Unpack 2 values from each byte
     x_quant = torch.zeros(x_packed.size(0), x_packed.size(1) * 2, dtype=torch.float32, device=x_packed.device)
@@ -46,33 +40,39 @@ def block_dequantize_4bit_optimized(x_packed: torch.Tensor, params: torch.Tensor
     x_quant[:, 1::2] = ((x_packed >> 4) & 0xF).to(torch.float32)
     
     # Dequantize
-    x = x_quant * scales + zeros
+    x_norm = x_quant / 15
+    x = x_norm * ranges + mins
     return x.view(-1)
 
 
 class LinearMixed(torch.nn.Module):
-    def __init__(self, in_features: int, out_features: int, bias: bool = True, group_size: int = 256) -> None:
+    def __init__(self, in_features: int, out_features: int, bias: bool = True, group_size: int = 512) -> None:
         super().__init__()
         self._shape = (out_features, in_features)
         self._group_size = group_size
 
-        # 4-bit packed weights with efficient storage
+        # 4-bit packed weights with ultra-efficient storage
         num_groups = (out_features * in_features) // group_size
         self.register_buffer(
             "weight_packed",
             torch.zeros(num_groups, group_size // 2, dtype=torch.uint8),
             persistent=False,
         )
-        # Even more aggressive - use single byte for both scale and zero
+        # Ultra-compact: single float16 for range (max - min), store min separately
         self.register_buffer(
-            "weight_params",
-            torch.zeros(num_groups, 2, dtype=torch.float16),
+            "weight_range",
+            torch.zeros(num_groups, dtype=torch.float16),
+            persistent=False,
+        )
+        self.register_buffer(
+            "weight_min",
+            torch.zeros(num_groups, dtype=torch.float16),
             persistent=False,
         )
         
         self._register_load_state_dict_pre_hook(LinearMixed._load_state_dict_pre_hook, with_module=True)
         
-        # Remove bias entirely for maximum compression
+        # No bias
         self.register_parameter('bias', None)
 
     def _load_state_dict_pre_hook(
@@ -89,14 +89,15 @@ class LinearMixed(torch.nn.Module):
                 padding = self._group_size - (total_elements % self._group_size)
                 weight_flat = torch.cat([weight_flat, torch.zeros(padding, dtype=weight_flat.dtype, device=weight_flat.device)])
             
-            weight_packed, params = block_quantize_4bit_optimized(weight_flat, self._group_size)
+            weight_packed, ranges, mins = block_quantize_4bit_optimized(weight_flat, self._group_size)
             
             self.weight_packed.copy_(weight_packed)
-            self.weight_params.copy_(params)
+            self.weight_range.copy_(ranges)
+            self.weight_min.copy_(mins)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         with torch.no_grad():
-            weight_dequant = block_dequantize_4bit_optimized(self.weight_packed, self.weight_params)
+            weight_dequant = block_dequantize_4bit_optimized(self.weight_packed, self.weight_range, self.weight_min)
             weight_matrix = weight_dequant[:self._shape[0] * self._shape[1]].view(self._shape)
             
             return torch.nn.functional.linear(x, weight_matrix, None)
@@ -110,13 +111,13 @@ class OptimizedLowPrecisionBigNet(torch.nn.Module):
     class Block(torch.nn.Module):
         def __init__(self, channels):
             super().__init__()
-            # Maximum group size for ultimate compression
+            # MASSIVE group size for final push
             self.model = torch.nn.Sequential(
-                LinearMixed(channels, channels, bias=False, group_size=256),
+                LinearMixed(channels, channels, bias=False, group_size=512),
                 torch.nn.ReLU(),
-                LinearMixed(channels, channels, bias=False, group_size=256),
+                LinearMixed(channels, channels, bias=False, group_size=512),
                 torch.nn.ReLU(),
-                LinearMixed(channels, channels, bias=False, group_size=256),
+                LinearMixed(channels, channels, bias=False, group_size=512),
             )
 
         def forward(self, x: torch.Tensor) -> torch.Tensor:
